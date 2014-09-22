@@ -18,8 +18,9 @@ Usage
 ```
 from hive import Hive
 hive = Hive('hiveserver')
-hive.execute('use foobar')
-hive.fetch('show tables')
+hive.execute('use foobar')  # command without getting results
+hive.fetch('show tables')   # get results from command as dataframe
+# iterate over long result, getting chunks of data
 for chunk in hive.iter('select * from baz limit 1000000'):
     print(chunk.tail())
 ```
