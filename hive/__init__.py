@@ -46,11 +46,16 @@ class AioHive:
 
             class local:
                 offset=0
+                empty=None
+
             @coroutine
             def to_frame(chunk_co):
-                data = pd.DataFrame((yield from chunk_co) or None, columns=columns)
+                data = pd.DataFrame((yield from chunk_co) or local.empty, columns=columns)
                 data.index += local.offset
+
                 local.offset += len(data)
+                if local.empty is None:
+                    local.empty = data[:0].copy()
                 return data
 
             def closing():
