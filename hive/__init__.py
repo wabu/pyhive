@@ -21,7 +21,11 @@ class AioHive:
 
     def execute(self, request):
         """ execute request without looking at returns """
-        yield from self.cli.execute(request)
+        cur = yield from self.cli.cursor()
+        try:
+            yield from cur.execute(hql)
+        finally:
+            yield from cur.close()
 
     def fetch(self, hql, chunk_size=10000):
         """ execute request and fetch answer as DataFrame """
