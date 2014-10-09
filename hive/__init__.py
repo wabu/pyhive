@@ -26,9 +26,7 @@ class AioHive:
     def fetch(self, hql, chunk_size=10000):
         """ execute request and fetch answer as DataFrame """
         cur = yield from self.cli.cursor()
-        print('init', cur)
         try:
-            print('enter', cur)
             yield from cur.execute(hql)
             schema = yield from cur.getSchema()
             columns = pd.Index([nfo['columnName'] for nfo in schema])
@@ -36,10 +34,6 @@ class AioHive:
             return pd.DataFrame((yield from cur.fetch(maxRows=chunk_size)) or None, columns=columns)
         finally:
             yield from cur.close()
-            print('done', cur)
-
-        
-
 
     def iter(self, hql, chunk_size=10000):
         """ execute request and iterate over chunks of resulting DataFrame """
@@ -72,7 +66,6 @@ class AioHive:
                         # here we yield the coroutine that will fetch the data and put in in a frame
                         yield to_frame(chunk)
                 finally:
-                    print('closing cursor')
                     # while ensuring that the cursor is closed after the request is done ....
                     cur.close()
 
