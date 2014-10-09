@@ -23,7 +23,7 @@ class AioHive:
         """ execute request without looking at returns """
         cur = yield from self.cli.cursor()
         try:
-            yield from cur.execute(hql)
+            yield from cur.execute(request)
         finally:
             yield from cur.close()
 
