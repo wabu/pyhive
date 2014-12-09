@@ -6,7 +6,7 @@ from functools import wraps
 coroutine = asyncio.coroutine
 
 class AioHive:
-    def __init__(self, host, port=10000):
+    def __init__(self, host=None, config=None, port=10000):
         """
         coroutine based hive client
 
@@ -17,6 +17,18 @@ class AioHive:
         port : int, default 10000
             port of the hiveserver2
         """
+        if (host is None and config is None) or (config and host):
+            raise TypeError('Either host or config argument has to be supplied')
+        if config:
+            import xml.etree.ElementTree as ET
+            cfg = ET.parse(config)
+            for res in cfg.iter('property'):
+                if res.findtext('name') == 'hive.metastore.uris':
+                    uri = res.findtext('value')
+                    host = uri.split('://')[-1].split(':')[0]
+                    break
+            else:
+                raise ValueError("could not find 'hive.metastore.uris' in config")
         self.cli = aiohs2.Client(host=host, port=port)
 
     def execute(self, request):
