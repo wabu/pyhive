@@ -119,6 +119,7 @@ class AioHive:
             class local:
                 offset = 0
                 empty = None
+                warns = set()
 
             @coroutine
             def to_frame(chunk_co):
@@ -133,8 +134,10 @@ class AioHive:
                     try:
                         df[col] = df[col].astype(typ)
                     except TypeError as e:
-                        logger.warning('Cannot convert %r to %r (%s)',
-                                       col, typ, e, exc_info=True)
+                        if col not in local.warns:
+                            logger.warning('Cannot convert %r to %r (%s)',
+                                        col, typ, e, exc_info=True)
+                            local.warns.add(col)
                 return df
 
             def closing():
