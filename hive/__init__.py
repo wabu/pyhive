@@ -136,7 +136,7 @@ class AioHive:
                     except TypeError as e:
                         if col not in local.warns:
                             logger.warning('Cannot convert %r to %r (%s)',
-                                        col, typ, e, exc_info=True)
+                                           col, typ, e)
                             local.warns.add(col)
                 return df
 
