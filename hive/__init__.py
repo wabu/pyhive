@@ -35,6 +35,50 @@ hive_type_map = {
 }
 
 
+class Framer:
+    def __init__(self, columns, dtypes):
+        self.columns = columns
+        self.dtypes = dtypes
+        self.offset = 0
+        self.warns = set()
+
+    @staticmethod
+    def get_dtype(typ):
+        try:
+            return hive_type_map[typ.rsplit('<', 1)[0].rsplit('_', 1)[0]]
+        except KeyError:
+            logger.warning('Unknown type %r for hive request', typ)
+            return pd.np.dtype(object)
+
+    @classmethod
+    @coroutine
+    def by_cursor(cls, cur, hql):
+        yield from cur.execute(hql)
+        schema = yield from cur.getSchema()
+        columns = pd.Index([nfo['columnName'] for nfo in schema])
+        dtypes = [cls.get_dtype(nfo['type']) for nfo in schema]
+        return cls(columns, dtypes)
+
+    @coroutine
+    def __call__(self, coro):
+        df = pd.DataFrame((yield from coro) or None,  # self.empty,
+                          columns=self.columns, dtype=object)
+        df.index += self.offset
+        self.offset += len(df)
+
+        # if self.empty is None:
+        #     local.empty = df[:0].copy()
+        for col, typ in zip(self.columns, self.dtypes):
+            try:
+                df[col] = df[col].astype(typ)
+            except TypeError as e:
+                if col not in self.warns:
+                    logger.warning('Cannot convert %r to %r (%s)',
+                                   col, typ, e)
+                    self.warns.add(col)
+        return df
+
+
 class AioHive:
     def __init__(self, host=None, config=None, port=10000):
         """
@@ -71,36 +115,13 @@ class AioHive:
         finally:
             yield from cur.close()
 
-    @staticmethod
-    def get_dtype(typ):
-        try:
-            return hive_type_map[typ.rsplit('<', 1)[0].rsplit('_', 1)[0]]
-        except KeyError:
-            logger.warning('Unknown type %r for hive request', typ)
-            return pd.np.dtype(object)
-
     @coroutine
     def fetch(self, hql, chunk_size=10000):
         """ execute request and fetch answer as DataFrame """
         cur = yield from self.cli.cursor()
         try:
-            yield from cur.execute(hql)
-            schema = yield from cur.getSchema()
-            columns = pd.Index([nfo['columnName'] for nfo in schema])
-            dtypes = [self.get_dtype(nfo['type']) for nfo in schema]
-
-            data = (yield from cur.fetch(maxRows=chunk_size)) or None
-            df = pd.DataFrame(data, columns=columns, dtype=object)
-            for col, typ in zip(columns, dtypes):
-                if typ == pd.np.dtype('datetime64') and df[col].isnull().all():
-                    df[col] = pd.NaT
-                else:
-                    try:
-                        df[col] = df[col].astype(typ)
-                    except TypeError as e:
-                        logger.warning('Cannot convert %r to %r (%s)',
-                                       col, typ, e)
-            return df
+            framer = yield from Framer.by_cursor(cur, hql)
+            return (yield from framer(cur.fetch(maxRows=chunk_size)))
         finally:
             yield from cur.close()
 
@@ -109,43 +130,15 @@ class AioHive:
         cur = yield from self.cli.cursor()
 
         try:
-            yield from cur.execute(hql)
-            schema = yield from cur.getSchema()
-            columns = pd.Index([nfo['columnName'] for nfo in schema])
-            dtypes = [self.get_dtype(nfo['type']) for nfo in schema]
-
+            framer = yield from Framer.by_cursor(cur, hql)
             chunks = cur.iter(maxRows=chunk_size)
-
-            class local:
-                offset = 0
-                empty = None
-                warns = set()
-
-            @coroutine
-            def to_frame(chunk_co):
-                df = pd.DataFrame((yield from chunk_co) or local.empty,
-                                  columns=columns, dtype=object)
-                df.index += local.offset
-
-                local.offset += len(df)
-                if local.empty is None:
-                    local.empty = df[:0].copy()
-                for col, typ in zip(columns, dtypes):
-                    try:
-                        df[col] = df[col].astype(typ)
-                    except TypeError as e:
-                        if col not in local.warns:
-                            logger.warning('Cannot convert %r to %r (%s)',
-                                           col, typ, e)
-                            local.warns.add(col)
-                return df
 
             def closing():
                 try:
                     for chunk in chunks:
                         # here we yield the coroutine that will fetch the data
                         # and put in in a frame
-                        yield to_frame(chunk)
+                        yield framer(chunk)
                 finally:
                     # while ensuring that the cursor is closed ...
                     cur.close()
