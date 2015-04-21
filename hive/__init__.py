@@ -102,27 +102,34 @@ class Framer:
 
 
 class RawHDFSChunker:
-    def __init__(self, hive, table, partitions):
+    def __init__(self, hive, table, partitions, fill_values=None):
         self.hive = hive
         self.table = table
         self.partitions = partitions[:]
+        self.fill_values = fill_values
 
         self.partition = None
         self.framer = None
         self.proc = None
         self.tail = b''
 
+        self.offset = 0
+        self.sep = None
+
     @coroutine
     def next_part(self):
         yield from self.close()
+        if not self.partitions:
+            raise StopIteration()
 
         self.partition = self.partitions.pop(0)
         self.framer, self.proc = yield from self.hive._raw_hdfs(
-            self.table, self.partition)
+            self.table, self.partition, fill_values=self.fill_values)
         self.tail = b''
 
     @coroutine
     def chunker(self):
+        chunk = None
         while True:
             if not self.partition:
                 yield from self.next_part()
@@ -144,7 +151,20 @@ class RawHDFSChunker:
                 break
 
         if chunk:
-            raw = [l.split('\t')[1:] for l in chunk.decode().split('\n')]
+            chunk = chunk.decode()
+            if self.sep is None:
+                for sep in ['\x01', '\t']:
+                    if sep in chunk:
+                        self.sep = sep
+                        break
+                else:
+                    raise ValueError('No Seperator found')
+                line, *_ = chunk.split('\n', 1)
+                cols = line.split(sep)
+                offset = len(cols) - len(self.framer.columns)
+                if offset > 0:
+                    self.offset = offset
+            raw = [l.split(self.sep)[self.offset:] for l in chunk.split('\n')]
             return self.framer.mk_df(raw, na_val='')
         else:
             return None
@@ -161,13 +181,16 @@ class RawHDFSChunker:
 
     @coroutine
     def close(self):
-        if self.proc:
-            self.proc.send_signal(subprocess.signal.SIGINT)
+        if self.proc and self.proc.returncode is None:
+            try:
+                self.proc.send_signal(subprocess.signal.SIGINT)
+            except ProcessLookupError:
+                pass
             yield from self.proc.wait()
 
 
 class AioHive:
-    def __init__(self, host=None, config=None, port=10000):
+    def __init__(self, host=None, port=10000, config=None, hadoop='hadoop'):
         """
         coroutine based hive client
 
@@ -179,6 +202,8 @@ class AioHive:
             hive-site.xml to extract hive.metastore.uris
         port : int, default 10000
             port of the hiveserver2
+        hadoop : str, optional
+            hadoop executable for raw hdfs access
         """
         if (host is None and config is None) or (config and host):
             raise TypeError('Either host or config argument has to be supplied')
@@ -195,6 +220,7 @@ class AioHive:
                     "could not find 'hive.metastore.uris' in config")
         self.cli = aiohs2.Client(host=host, port=port)
         self.config = config
+        self.hadoop = hadoop
 
     @coroutine
     def execute(self, *rqs):
@@ -240,7 +266,7 @@ class AioHive:
         yield from self.cli.close()
 
     @coroutine
-    def _raw_hdfs(self, table, partition):
+    def _raw_hdfs(self, table, partition, fill_values=None):
         info = (yield from self.fetch(
             'describe formatted {table} partition ({partition})'
             .format(table=table,
@@ -255,17 +281,20 @@ class AioHive:
         dtypes = (schema.data_type
                   .str.split('(').str[0].str.upper()
                   .apply(hive_type_map.__getitem__))
-        framer = Framer(columns, dtypes)
+        framer = Framer(columns, dtypes, fill_values=fill_values)
 
         proc = yield from asyncio.create_subprocess_exec(
-            'hadoop', 'fs', '-text',
+            self.hadoop, 'fs', '-text',
             '/'+location.split('://', 1)[1].split('/', 1)[1]+'/*',
             stdout=subprocess.PIPE)
 
         return framer, proc
 
     @coroutine
-    def raw(self, table, **partitions):
+    def raw(self, table, fill_values=None, **partitions):
+        if '.' in table:
+            db, table = table.rsplit('.', 1)
+            yield from self.execute('use {db}'.format(db=db))
         parts = yield from self.fetch('show partitions {}'.format(table))
         parts = parts.partition
 
@@ -273,7 +302,7 @@ class AioHive:
         names = info.str[0]
         vals = info.str[1]
 
-        sel = pd.Series(False, index=parts.index)
+        sel = pd.Series(not bool(partitions), index=parts.index)
         for name, val in partitions.items():
             if name not in names.values:
                 raise KeyError('no partition info {} in {}', name, table)
@@ -282,7 +311,8 @@ class AioHive:
             for v in val:
                 sel |= (names == name) & (vals.str.contains(v))
 
-        rhc = RawHDFSChunker(self, table, list(parts[sel]))
+        rhc = RawHDFSChunker(self, table, list(parts[sel]),
+                             fill_values=fill_values)
         return rhc.iter()
 
 
