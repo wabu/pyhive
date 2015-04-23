@@ -69,7 +69,7 @@ class Framer:
         raw = yield from coro
         return self.mk_df(raw)
 
-    def mk_df(self, raw, na_val=None):
+    def mk_df(self, raw, na_vals=None):
         if self.columns is None:
             if raw is None:
                 return None
@@ -81,8 +81,8 @@ class Framer:
                 return pd.DataFrame(raw, dtype=object)
         df = pd.DataFrame(raw or None,  # self.empty,
                           columns=self.columns, dtype=object)
-        if na_val is not None:
-            df[df == na_val] = None
+        if na_vals is not None:
+            df[df.isin(na_vals)] = None
         df.index += self.offset
         self.offset += len(df)
 
@@ -99,7 +99,7 @@ class Framer:
                     except ValueError:
                         pass
                 df[col] = df[col].astype(typ)
-            except TypeError as e:
+            except (TypeError, ValueError) as e:
                 if col not in self.warns:
                     logger.warning('Cannot convert %r to %r (%s)', col, typ, e)
                     self.warns.add(col)
@@ -156,7 +156,7 @@ class RawHDFSChunker:
         if chunk:
             chunk = chunk.decode()
             if self.sep is None:
-                for sep in ['\x01', '\t']:
+                for sep in ['\x01', '\t', ', ', ',']:
                     if sep in chunk:
                         self.sep = sep
                         break
@@ -168,7 +168,7 @@ class RawHDFSChunker:
                 if offset > 0:
                     self.offset = offset
             raw = [l.split(self.sep)[self.offset:] for l in chunk.split('\n')]
-            return self.framer.mk_df(raw, na_val='')
+            return self.framer.mk_df(raw, na_vals=['', '\\N'])
         else:
             return None
 
@@ -269,12 +269,15 @@ class AioHive:
         yield from self.cli.close()
 
     @coroutine
-    def _raw_hdfs(self, table, partition, fill_values=None):
+    def _raw_hdfs(self, table, partition=True, fill_values=None):
+        if partition is True:
+            rq = 'describe formatted {table}'
+        else:
+            rq = 'describe formatted {table} partition ({partition})'
+            partition = partition.replace('=', '="')+'"'
+
         info = (yield from self.fetch(
-            'describe formatted {table} partition ({partition})'
-            .format(table=table,
-                    partition=partition.replace('=', '="')+'"'))).applymap(
-                        str.strip)
+            rq.format(table=table, partition=partition))).applymap(str.strip)
 
         i0, i1, *_ = pd.np.flatnonzero(info.col_name == '')
         schema = info[i0+1:i1]
@@ -299,25 +302,28 @@ class AioHive:
         if '.' in table:
             db, table = table.rsplit('.', 1)
             yield from self.execute('use {db}'.format(db=db))
-        info = (yield from self.fetch('describe formatted {}'.format(table))
-                ).applymap(str.strip)
 
-        parts = yield from self.fetch('show partitions {}'.format(table))
-        parts = parts.partition
+        try:
+            parts = yield from self.fetch('show partitions {}'.format(table))
+            parts = parts.partition
 
-        info = parts.str.split('=')
-        names = info.str[0]
-        vals = info.str[1]
+            info = parts.str.split('=')
+            names = info.str[0]
+            vals = info.str[1]
 
-        sel = pd.Series(not bool(partitions), index=parts.index)
-        for name, val in partitions.items():
-            if name not in names.values:
-                raise KeyError('no partition info {} in {}', name, table)
-            if isinstance(val, str):
-                val = [val]
-            for v in val:
-                sel |= (names == name) & (vals.str.contains(v))
-        select = list(parts[sel])
+            sel = pd.Series(not bool(partitions), index=parts.index)
+            for name, val in partitions.items():
+                if name not in names.values:
+                    raise KeyError('no partition info {} in {}', name, table)
+                if isinstance(val, str):
+                    val = [val]
+                for v in val:
+                    sel |= (names == name) & (vals.str.contains(v))
+            select = list(parts[sel])
+        except aiohs2.error.Pyhs2Exception as e:
+            if partitions:
+                raise e
+            select = [True]
 
         rhc = RawHDFSChunker(self, table, select,
                              fill_values=fill_values)
