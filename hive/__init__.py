@@ -22,8 +22,8 @@ hive_type_map = {
     'DOUBLE': pd.np.dtype(float),
     'DECIMAL': pd.np.dtype(float),
 
-    'TIMESTAMP': pd.np.dtype('datetime64'),
-    'DATE':      pd.np.dtype('datetime64'),
+    'TIMESTAMP': pd.np.dtype('datetime64[ms]'),
+    'DATE':      pd.np.dtype('datetime64[ms]'),
 
     'STRING': pd.np.dtype(str),
     'VARCHAR': pd.np.dtype(str),
@@ -93,6 +93,11 @@ class Framer:
         #     local.empty = df[:0].copy()
         for col, typ in zip(self.columns, self.dtypes):
             try:
+                if typ == pd.np.dtype('datetime64[ms]'):
+                    try:
+                        df[col] = df[col].astype(int)
+                    except ValueError:
+                        pass
                 df[col] = df[col].astype(typ)
             except TypeError as e:
                 if col not in self.warns:
@@ -119,8 +124,6 @@ class RawHDFSChunker:
     @coroutine
     def next_part(self):
         yield from self.close()
-        if not self.partitions:
-            raise StopIteration()
 
         self.partition = self.partitions.pop(0)
         self.framer, self.proc = yield from self.hive._raw_hdfs(
@@ -130,7 +133,7 @@ class RawHDFSChunker:
     @coroutine
     def chunker(self):
         chunk = None
-        while True:
+        while self.partition or self.partitions:
             if not self.partition:
                 yield from self.next_part()
 
@@ -174,7 +177,7 @@ class RawHDFSChunker:
             while True:
                 fut = asyncio.async(self.chunker())
                 yield fut
-                if not fut.result:
+                if fut.result() is None:
                     break
         finally:
             yield self.close()
@@ -279,7 +282,8 @@ class AioHive:
 
         columns = schema.col_name
         dtypes = (schema.data_type
-                  .str.split('(').str[0].str.upper()
+                  .str.split('(').str[0]
+                  .str.split('<').str[0].str.upper()
                   .apply(hive_type_map.__getitem__))
         framer = Framer(columns, dtypes, fill_values=fill_values)
 
@@ -295,6 +299,9 @@ class AioHive:
         if '.' in table:
             db, table = table.rsplit('.', 1)
             yield from self.execute('use {db}'.format(db=db))
+        info = (yield from self.fetch('describe formatted {}'.format(table))
+                ).applymap(str.strip)
+
         parts = yield from self.fetch('show partitions {}'.format(table))
         parts = parts.partition
 
@@ -310,8 +317,9 @@ class AioHive:
                 val = [val]
             for v in val:
                 sel |= (names == name) & (vals.str.contains(v))
+        select = list(parts[sel])
 
-        rhc = RawHDFSChunker(self, table, list(parts[sel]),
+        rhc = RawHDFSChunker(self, table, select,
                              fill_values=fill_values)
         return rhc.iter()
 
