@@ -118,7 +118,8 @@ class RawHDFSChunker:
         self.proc = None
         self.tail = b''
 
-        self.offset = 0
+        self.sel = slice(None)
+        self.nl = None
         self.sep = None
 
     @coroutine
@@ -155,19 +156,37 @@ class RawHDFSChunker:
 
         if chunk:
             chunk = chunk.decode()
+            if self.nl is None:
+                for nl in ['\r\n', '\n']:
+                    if nl in chunk:
+                        self.nl = nl
+                        break
+                else:
+                    raise ValueError('No NewLine found')
             if self.sep is None:
-                for sep in ['\x01', '\t', ', ', ',']:
+                for sep in ['\x01', '\t', '; ', ';', ', ', ',']:
                     if sep in chunk:
                         self.sep = sep
                         break
                 else:
-                    raise ValueError('No Seperator found')
-                line, *_ = chunk.split('\n', 1)
+                    if len(self.framer.columns) > 1:
+                        raise ValueError('No Seperator found')
+                    else:
+                        self.sep = sep = '\x01'
+                line, *_ = chunk.split(self.nl, 1)
                 cols = line.split(sep)
                 offset = len(cols) - len(self.framer.columns)
                 if offset > 0:
-                    self.offset = offset
-            raw = [l.split(self.sep)[self.offset:] for l in chunk.split('\n')]
+                    nils = ['(null)', 'null', 'none', '']
+                    if (cols[0].lower() not in nils
+                            and cols[-1].lower() in nils):
+                        self.sel = slice(-offset)
+                    elif (cols[-1].lower() not in nils
+                            and cols[0].lower() in nils):
+                        self.sel = slice(offset)
+                    else:
+                        raise ValueError('Donno what to do')
+            raw = [l.split(self.sep)[self.sel] for l in chunk.split('\n')]
             return self.framer.mk_df(raw, na_vals=['', '\\N'])
         else:
             return None
