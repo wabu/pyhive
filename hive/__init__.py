@@ -2,6 +2,8 @@ import asyncio
 import aiohs2
 import pandas as pd
 import subprocess
+import urllib
+import re
 
 import logging
 
@@ -34,6 +36,12 @@ hive_type_map = {
     'STRUCT': pd.np.dtype(object),
     'UNIONTYPE': pd.np.dtype(object),
 }
+
+hive_nils = ['(null)', 'null', 'none', '']
+
+
+def hive_isnull(val):
+    return val.str.lower().isin(hive_nils)
 
 
 class Framer:
@@ -100,14 +108,19 @@ class Framer:
                         pass
                 df[col] = df[col].astype(typ)
             except (TypeError, ValueError) as e:
+                first = not bool(self.warns)
                 if col not in self.warns:
                     logger.warning('Cannot convert %r to %r (%s)', col, typ, e)
                     self.warns.add(col)
+                if first:
+                    logger.warning('consider passing fill_values={%r: ...} '
+                                   'as argument to your request', col)
         return df
 
 
 class RawHDFSChunker:
-    def __init__(self, hive, table, partitions, fill_values=None):
+    def __init__(self, hive, table, partitions, fill_values=None,
+                 sep=None, nl='\n', strip='\r\t'):
         self.hive = hive
         self.table = table
         self.partitions = partitions[:]
@@ -118,9 +131,11 @@ class RawHDFSChunker:
         self.proc = None
         self.tail = b''
 
+        self.sep = sep
+        self.nl = nl
+        self.strip = strip
         self.sel = slice(None)
-        self.nl = None
-        self.sep = None
+        self.fill = []
 
     @coroutine
     def next_part(self):
@@ -156,38 +171,54 @@ class RawHDFSChunker:
 
         if chunk:
             chunk = chunk.decode()
-            if self.nl is None:
-                for nl in ['\r\n', '\n']:
-                    if nl in chunk:
-                        self.nl = nl
-                        break
-                else:
-                    raise ValueError('No NewLine found')
             if self.sep is None:
-                for sep in ['\x01', '\t', '; ', ';', ', ', ',']:
-                    if sep in chunk:
-                        self.sep = sep
-                        break
+                self.l = len(self.framer.columns)
+
+                if self.l == 1:
+                    self.sep = sep = '\x01'
                 else:
-                    if len(self.framer.columns) > 1:
+                    # guess se seperator
+                    for sep in ['\x01', '\t', ';', ',', ' | ', ' ']:
+                        if sep in chunk:
+                            self.sep = sep
+                            break
+                    else:
                         raise ValueError('No Seperator found')
+
+                    if sep == '\t':
+                        self.strip = '\r'
+                    elif sep == ' | ':
+                        self.strip = ' \r\t'
+                lines = (pd.Series(chunk.split(self.nl))
+                         .str.strip(self.strip).str.split(self.sep))
+                l = int(lines.str.len().median())
+
+                diff = l - self.l
+                a = 0
+                b = 0
+                while diff > 0:
+                    if hive_isnull(lines.str[a]).all():
+                        a += 1
+                        diff -= 1
+                    elif hive_isnull(lines.str[-(b+1)]).all():
+                        b += 1
+                        diff -= 1
                     else:
-                        self.sep = sep = '\x01'
-                line, *_ = chunk.split(self.nl, 1)
-                cols = line.split(sep)
-                offset = len(cols) - len(self.framer.columns)
-                if offset > 0:
-                    nils = ['(null)', 'null', 'none', '']
-                    if (cols[0].lower() not in nils
-                            and cols[-1].lower() in nils):
-                        self.sel = slice(-offset)
-                    elif (cols[-1].lower() not in nils
-                            and cols[0].lower() in nils):
-                        self.sel = slice(offset)
-                    else:
-                        raise ValueError('Donno what to do')
-            raw = [l.split(self.sep)[self.sel] for l in chunk.split('\n')]
-            return self.framer.mk_df(raw, na_vals=['', '\\N'])
+                        b += diff
+                        diff = 0
+                if diff < 0:
+                    self.fill = [None] * (-diff)
+                    diff = 0
+                self.sel = slice(a or None, l - b if b else None)
+
+            raw = (cs + self.fill
+                   for cs in (l.strip(self.strip).split(self.sep)[self.sel]
+                              for l in chunk.split(self.nl))
+                   if cs)
+            return self.framer.mk_df(raw, na_vals=['',
+                                                   '\\N', 'n/a',
+                                                   'NaN', 'nan'
+                                                   '(null)', 'null'])
         else:
             return None
 
@@ -293,14 +324,28 @@ class AioHive:
             rq = 'describe formatted {table}'
         else:
             rq = 'describe formatted {table} partition ({partition})'
-            partition = partition.replace('=', '="')+'"'
 
         info = (yield from self.fetch(
             rq.format(table=table, partition=partition))).applymap(str.strip)
 
         i0, i1, *_ = pd.np.flatnonzero(info.col_name == '')
         schema = info[i0+1:i1]
-        location = info.query('col_name == "Location:"').data_type.iloc[0]
+        location = info.query('col_name == "Location:"').data_type
+        if location.empty:
+            raise KeyError('table {} seems not to be marterialized'
+                           .format(table))
+
+        proc = yield from asyncio.create_subprocess_exec(
+            self.hadoop, 'fs', '-ls', '-R', *location.values,
+            stdout=subprocess.PIPE)
+        out = (yield from proc.stdout.read()).decode().split('\n')
+        location = [f
+                    for f in (re.split('\s+', l, 7)[-1]
+                              for l in out if l.startswith('-'))
+                    if f.rsplit('/', 1)[-1][0] not in '._']
+        if not location:
+            raise KeyError('table {} seems not to be filled'
+                           .format(table))
 
         columns = schema.col_name
         dtypes = (schema.data_type
@@ -310,8 +355,7 @@ class AioHive:
         framer = Framer(columns, dtypes, fill_values=fill_values)
 
         proc = yield from asyncio.create_subprocess_exec(
-            self.hadoop, 'fs', '-text',
-            '/'+location.split('://', 1)[1].split('/', 1)[1]+'/*',
+            self.hadoop, 'fs', '-text', *location,
             stdout=subprocess.PIPE)
 
         return framer, proc
@@ -324,25 +368,34 @@ class AioHive:
 
         try:
             parts = yield from self.fetch('show partitions {}'.format(table))
-            parts = parts.partition
+            if parts.empty:
+                parts = None
+        except aiohs2.error.Pyhs2Exception as e:
+            parts = None
 
-            info = parts.str.split('=')
-            names = info.str[0]
-            vals = info.str[1]
+        if parts is None:
+            if partitions:
+                raise e
+            select = [True]
+        else:
+            parts = (parts
+                     .applymap(urllib.parse.unquote)
+                     .partition.str.split('/', return_type='frame')
+                     .unstack().str.split('=', return_type='frame')
+                     .reset_index().set_index(['level_1', 0])[1]
+                     .unstack())
 
             sel = pd.Series(not bool(partitions), index=parts.index)
             for name, val in partitions.items():
-                if name not in names.values:
+                if name not in parts.columns:
                     raise KeyError('no partition info {} in {}', name, table)
                 if isinstance(val, str):
                     val = [val]
                 for v in val:
-                    sel |= (names == name) & (vals.str.contains(v))
-            select = list(parts[sel])
-        except aiohs2.error.Pyhs2Exception as e:
-            if partitions:
-                raise e
-            select = [True]
+                    sel |= parts[name].str.contains(v)
+            select = list((parts[sel].columns.values[None, :]
+                           + "='" + parts[sel] + "'")
+                          .apply(', '.join, axis=1))
 
         rhc = RawHDFSChunker(self, table, select,
                              fill_values=fill_values)
