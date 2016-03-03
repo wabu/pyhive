@@ -95,12 +95,17 @@ class Framer:
         self.offset += len(df)
 
         for col, val in self.fill_values.items():
-            df[col] = df[col].fillna(val)
+            if col in df:
+                df[col] = df[col].fillna(val)
 
         # if self.empty is None:
         #     local.empty = df[:0].copy()
         for col, typ in zip(self.columns, self.dtypes):
             try:
+                if typ == pd.np.dtype(str):
+                    # don't convert str again, as it will turn None into 'None'
+                    continue
+
                 if typ == pd.np.dtype('datetime64[ms]'):
                     try:
                         df[col] = df[col].astype(int)
@@ -380,8 +385,8 @@ class AioHive:
         else:
             parts = (parts
                      .applymap(urllib.parse.unquote)
-                     .partition.str.split('/', return_type='frame')
-                     .unstack().str.split('=', return_type='frame')
+                     .partition.str.split('/', expand=True)
+                     .unstack().str.split('=', expand=True)
                      .reset_index().set_index(['level_1', 0])[1]
                      .unstack())
 
