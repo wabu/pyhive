@@ -331,7 +331,7 @@ class AioHive:
             rq = 'describe formatted {table} partition ({partition})'
 
         info = (yield from self.fetch(
-            rq.format(table=table, partition=partition))).applymap(str.strip)
+            rq.format(table=table, partition=partition))).fillna('').applymap(str.strip)
 
         i0, i1, *_ = pd.np.flatnonzero(info.col_name == '')
         schema = info[i0+1:i1]
