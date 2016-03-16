@@ -176,7 +176,7 @@ class RawHDFSChunker:
 
         if chunk:
             chunk = chunk.decode()
-            if self.sep is None:
+            if True: # FIXME when to initialize # self.sep is None:
                 self.l = len(self.framer.columns)
 
                 if self.l == 1:
